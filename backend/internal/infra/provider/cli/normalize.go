@@ -165,16 +165,22 @@ func updateBuildReasoningMetadata(payload map[string]json.RawMessage, model stri
 
 func buildReasoningEffort(payload map[string]json.RawMessage) (string, bool) {
 	raw := payload["reasoning"]
-	if isEmptyJSON(raw) {
-		return "", false
+	if !isEmptyJSON(raw) {
+		var reasoning struct {
+			Effort string `json:"effort"`
+		}
+		if json.Unmarshal(raw, &reasoning) == nil && strings.TrimSpace(reasoning.Effort) != "" {
+			return reasoning.Effort, true
+		}
 	}
-	var reasoning struct {
-		Effort string `json:"effort"`
+	// Chat Completions and some Responses clients send a bare reasoning_effort.
+	if raw, exists := payload["reasoning_effort"]; exists && !isEmptyJSON(raw) {
+		var effort string
+		if json.Unmarshal(raw, &effort) == nil && strings.TrimSpace(effort) != "" {
+			return effort, true
+		}
 	}
-	if json.Unmarshal(raw, &reasoning) != nil || strings.TrimSpace(reasoning.Effort) == "" {
-		return "", false
-	}
-	return reasoning.Effort, true
+	return "", false
 }
 
 // applyBuildResponseDefaults mirrors the official Grok Build client boundary.
@@ -208,10 +214,15 @@ func applyBuildResponseDefaults(payload map[string]json.RawMessage) (bool, error
 // tiers the model does not offer are folded onto the nearest offered level:
 // minimal -> low, max -> xhigh -> high. Grok 4.5 and unknown models therefore
 // retain the proven defensive xhigh/max -> high behavior.
+//
+// `none` (disable reasoning) is only forwarded when the model offers it.
+// Models such as grok-4.5/4.6/4.7 cannot disable reasoning and reject
+// reasoning_effort=none with invalid-argument; the control is dropped instead
+// so the request falls back to the model's default effort.
 func normalizeBuildReasoningEffortPayload(payload map[string]json.RawMessage, model string) bool {
 	raw, exists := payload["reasoning"]
 	if !exists || isEmptyJSON(raw) {
-		return false
+		return normalizeBuildTopLevelReasoningEffort(payload, model)
 	}
 	var reasoning map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &reasoning); err != nil || reasoning == nil {
@@ -222,7 +233,7 @@ func normalizeBuildReasoningEffortPayload(payload map[string]json.RawMessage, mo
 	// such as summary, but never forward reasoning.effort to Composer.
 	if modeldomain.IsGrokComposerModel(model) {
 		if _, exists := reasoning["effort"]; !exists {
-			return false
+			return normalizeBuildTopLevelReasoningEffort(payload, model)
 		}
 		delete(reasoning, "effort")
 		if len(reasoning) == 0 {
@@ -234,10 +245,60 @@ func normalizeBuildReasoningEffortPayload(payload map[string]json.RawMessage, mo
 	}
 	var effort string
 	if err := json.Unmarshal(reasoning["effort"], &effort); err != nil {
+		return normalizeBuildTopLevelReasoningEffort(payload, model)
+	}
+	normalized, changed := resolveBuildReasoningEffort(model, effort)
+	if !changed {
+		return normalizeBuildTopLevelReasoningEffort(payload, model)
+	}
+	if normalized == "" {
+		delete(reasoning, "effort")
+	} else {
+		reasoning["effort"] = mustJSON(normalized)
+	}
+	if len(reasoning) == 0 {
+		delete(payload, "reasoning")
+	} else {
+		payload["reasoning"] = mustJSON(reasoning)
+	}
+	return true
+}
+
+// normalizeBuildTopLevelReasoningEffort applies the same folding rules to the
+// Chat Completions reasoning_effort field, which some clients send instead of
+// the Responses reasoning.effort object.
+func normalizeBuildTopLevelReasoningEffort(payload map[string]json.RawMessage, model string) bool {
+	raw, exists := payload["reasoning_effort"]
+	if !exists || isEmptyJSON(raw) {
 		return false
 	}
+	var effort string
+	if err := json.Unmarshal(raw, &effort); err != nil {
+		return false
+	}
+	if modeldomain.IsGrokComposerModel(model) {
+		delete(payload, "reasoning_effort")
+		return true
+	}
+	normalized, changed := resolveBuildReasoningEffort(model, effort)
+	if !changed {
+		return false
+	}
+	if normalized == "" {
+		delete(payload, "reasoning_effort")
+	} else {
+		payload["reasoning_effort"] = mustJSON(normalized)
+	}
+	return true
+}
+
+// resolveBuildReasoningEffort returns the wire effort to forward and whether it
+// differs from the request. When the requested tier is unavailable — including
+// `none` on models that cannot disable reasoning — the effort is proactively
+// filled in as `high` (the gateway default) instead of forwarding a value the
+// upstream rejects or omitting the control entirely.
+func resolveBuildReasoningEffort(model, effort string) (normalized string, changed bool) {
 	requested := strings.ToLower(strings.TrimSpace(effort))
-	var normalized string
 	switch requested {
 	case modeldomain.ReasoningEffortMinimal:
 		normalized = foldBuildReasoningEffort(model, modeldomain.ReasoningEffortMinimal, modeldomain.ReasoningEffortLow)
@@ -245,15 +306,35 @@ func normalizeBuildReasoningEffortPayload(payload map[string]json.RawMessage, mo
 		normalized = foldBuildReasoningEffort(model, modeldomain.ReasoningEffortXHigh, modeldomain.ReasoningEffortHigh)
 	case modeldomain.ReasoningEffortMax:
 		normalized = foldBuildReasoningEffort(model, modeldomain.ReasoningEffortMax, modeldomain.ReasoningEffortXHigh, modeldomain.ReasoningEffortHigh)
+	case modeldomain.ReasoningEffortNone:
+		if modeldomain.SupportsReasoningEffort(model, modeldomain.ReasoningEffortNone) {
+			normalized = modeldomain.ReasoningEffortNone
+		} else {
+			// Reasoning cannot be disabled on this model: proactively use high
+			// rather than sending an effort the upstream rejects.
+			normalized = defaultBuildReasoningEffort(model)
+		}
+	case modeldomain.ReasoningEffortLow, modeldomain.ReasoningEffortMedium, modeldomain.ReasoningEffortHigh:
+		if modeldomain.SupportsReasoningEffort(model, requested) {
+			normalized = requested
+		} else {
+			normalized = defaultBuildReasoningEffort(model)
+		}
 	default:
-		return false
+		// auto and unrecognized values are not wire tiers: fill in the default.
+		normalized = defaultBuildReasoningEffort(model)
 	}
 	if effort == normalized {
-		return false
+		return effort, false
 	}
-	reasoning["effort"] = mustJSON(normalized)
-	payload["reasoning"] = mustJSON(reasoning)
-	return true
+	return normalized, true
+}
+
+// defaultBuildReasoningEffort is the gateway fill-in when a requested tier is
+// unavailable. `high` is the default; it folds down only if the model does not
+// offer high either.
+func defaultBuildReasoningEffort(model string) string {
+	return foldBuildReasoningEffort(model, modeldomain.ReasoningEffortHigh, modeldomain.ReasoningEffortMedium, modeldomain.ReasoningEffortLow)
 }
 
 // foldBuildReasoningEffort returns the first candidate tier the model offers,

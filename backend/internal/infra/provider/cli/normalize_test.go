@@ -68,6 +68,15 @@ func TestNormalizeBuildReasoningEffort(t *testing.T) {
 		{name: "catalog without xhigh folds max to high", model: "grok-menu-plain", effort: "max", want: "high"},
 		{name: "catalog without xhigh folds xhigh to high", model: "grok-menu-plain", effort: "XHIGH", want: "high"},
 		{name: "catalog without low folds minimal to low fallback", model: "grok-menu-plain", effort: "minimal", want: "low"},
+		// none is forwarded only when the model can disable reasoning; otherwise
+		// the effort is proactively filled in as high (gateway default).
+		{name: "4.5 none becomes high", model: "grok-4.5", effort: "none", want: "high"},
+		{name: "4.6 none becomes high", model: "grok-4.6", effort: "none", want: "high"},
+		{name: "4.7 none becomes high", model: "grok-4.7", effort: "none", want: "high"},
+		{name: "4.3 none is kept", model: "grok-4.3", effort: "none", want: "none"},
+		{name: "build-0.1 none is kept", model: "grok-build-0.1", effort: "none", want: "none"},
+		{name: "4.5 NONE becomes high", model: "grok-4.5", effort: "NONE", want: "high"},
+		{name: "auto becomes high", model: "grok-4.5", effort: "auto", want: "high"},
 	}
 	modeldomain.ResetUpstreamProfiles()
 	t.Cleanup(modeldomain.ResetUpstreamProfiles)
@@ -85,12 +94,49 @@ func TestNormalizeBuildReasoningEffort(t *testing.T) {
 			if err := json.Unmarshal(normalized, &payload); err != nil {
 				t.Fatal(err)
 			}
-			reasoning, ok := payload["reasoning"].(map[string]any)
-			if !ok || reasoning["effort"] != test.want {
-				t.Fatalf("reasoning = %#v, want %q", payload["reasoning"], test.want)
+			if test.want == "" {
+				if reasoning, ok := payload["reasoning"].(map[string]any); ok {
+					if _, exists := reasoning["effort"]; exists {
+						t.Fatalf("reasoning = %#v, want effort removed", payload["reasoning"])
+					}
+				}
+			} else {
+				reasoning, ok := payload["reasoning"].(map[string]any)
+				if !ok || reasoning["effort"] != test.want {
+					t.Fatalf("reasoning = %#v, want %q", payload["reasoning"], test.want)
+				}
 			}
 			if metadata.ReasoningEffort != test.want {
 				t.Fatalf("metadata effort = %q, want %q", metadata.ReasoningEffort, test.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeBuildTopLevelReasoningEffortNoneDroppedWhenUnsupported(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		model string
+		body  string
+		want  string
+	}{
+		{name: "4.5 chat none becomes high", model: "grok-4.5", body: `{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"none"}`, want: "high"},
+		{name: "4.3 chat none kept", model: "grok-4.3", body: `{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"none"}`, want: "none"},
+		{name: "4.5 chat high kept", model: "grok-4.5", body: `{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}`, want: "high"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			metadata := &provider.NormalizedRequestMetadata{}
+			normalized, err := normalizeBuildRequestWithMetadata([]byte(test.body), test.model, conversation.OperationChat, metadata)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(normalized, &payload); err != nil {
+				t.Fatal(err)
+			}
+			raw, exists := payload["reasoning_effort"]
+			if !exists || raw != test.want {
+				t.Fatalf("reasoning_effort = %#v, want %q", raw, test.want)
 			}
 		})
 	}

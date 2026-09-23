@@ -1262,18 +1262,21 @@ func (h *Handler) writeProtocolResult(c *gin.Context, result *gateway.Result, st
 		return
 	}
 	body := io.Reader(result.Body)
-	if !stream && result.StatusCode >= http.StatusOK && result.StatusCode < http.StatusMultipleChoices {
+	// Delay the downstream 2xx status for both streaming and non-streaming 2xx
+	// responses until upstream produces at least one byte. A stream that idles
+	// out or closes empty before any data must become a retryable error, not a
+	// committed 200 that agents treat as a finished turn. Once the first byte is
+	// peeked, the remaining copy streams unchanged (including mid-stream idle →
+	// 200 + abort trailer, which cannot change the committed status).
+	if result.StatusCode >= http.StatusOK && result.StatusCode < http.StatusMultipleChoices {
 		var peekErr error
 		body, peekErr = peekNonEmptyJSONBody(result.Body)
 		if peekErr != nil {
-			status, code, message := http.StatusBadGateway, "stream_interrupted", "读取上游响应失败"
-			switch {
-			case neterror.IsUpstreamStreamIdleTimeout(peekErr):
-				status, code, message = http.StatusGatewayTimeout, "upstream_stream_idle_timeout", "上游响应长时间无数据"
-			case neterror.IsUpstreamResponseEmpty(peekErr):
-				status, code, message = http.StatusBadGateway, "upstream_response_empty", "上游响应为空"
-			}
+			status, code, message := preCommitStreamFailureResponse(peekErr)
 			errorCode = code
+			if status == http.StatusTooManyRequests {
+				c.Header("Retry-After", "1")
+			}
 			if anthropic {
 				writeAnthropicError(c, status, "api_error", message, code)
 			} else {
@@ -1318,7 +1321,9 @@ func (h *Handler) writeProtocolResult(c *gin.Context, result *gateway.Result, st
 	c.Status(result.StatusCode)
 	var err error
 	if stream {
-		metadata, copyErr := copyStreamWithFallbackModel(c.Writer, result.Body, protocol, result.MarkFirstToken, fallbackModel)
+		// Use the peeked reader — result.Body was already partially consumed by
+		// peekNonEmptyJSONBody and must not be read directly again.
+		metadata, copyErr := copyStreamWithFallbackModel(c.Writer, body, protocol, result.MarkFirstToken, fallbackModel)
 		usage, responseID, err = metadata.Usage, metadata.ResponseID, copyErr
 		if metadata.StreamFailure != nil && result.RecordStreamFailure != nil {
 			result.RecordStreamFailure(*metadata.StreamFailure)
@@ -1329,6 +1334,45 @@ func (h *Handler) writeProtocolResult(c *gin.Context, result *gateway.Result, st
 	}
 	if err != nil {
 		errorCode = classifyCopyError(c.Request.Context(), err)
+		// Pre-commit stream failure: nothing has been written yet, so the 2xx
+		// selected above is still overridable. Commit a retryable 429 instead —
+		// agents treat 200 as a finished turn and will not retry. Keep the
+		// precise errorCode from classifyCopyError for audit and finalize.
+		if stream && !c.Writer.Written() && errorCode != "client_stream_interrupted" {
+			status, _, message := preCommitStreamFailureResponse(err)
+			if status == http.StatusTooManyRequests {
+				c.Header("Retry-After", "1")
+			}
+			if anthropic {
+				writeAnthropicError(c, status, "api_error", message, errorCode)
+			} else {
+				writeOpenAIError(c, status, errorCode, message)
+			}
+		}
+	}
+}
+
+// preCommitStreamFailureResponse maps an upstream failure observed before any
+// downstream byte to a client status and message. The code for the response
+// body and finalize comes from classifyCopyError. Retryable transport failures
+// (idle, interrupted, empty) return 429 so LLM agents retry instead of treating
+// the request as a completed turn.
+func preCommitStreamFailureResponse(err error) (status int, code, message string) {
+	switch {
+	case neterror.IsUpstreamStreamIdleTimeout(err):
+		return http.StatusTooManyRequests, "upstream_stream_idle_timeout", "上游响应长时间无数据，请重试"
+	case neterror.IsUpstreamResponseEmpty(err):
+		return http.StatusTooManyRequests, "upstream_response_empty", "上游响应为空，请重试"
+	case errors.Is(err, errUpstreamStreamIncomplete):
+		return http.StatusTooManyRequests, "upstream_stream_incomplete", "上游流式响应未完整结束，请重试"
+	case errors.Is(err, errUpstreamStreamRead), errors.Is(err, errUpstreamStreamFailed):
+		return http.StatusTooManyRequests, "upstream_stream_interrupted", "上游流式响应中断，请重试"
+	case errors.Is(err, neterror.ErrUpstreamOutputLoop):
+		return http.StatusBadGateway, "upstream_output_loop", "上游输出陷入循环"
+	case errors.Is(err, errResponseTransferLimit):
+		return http.StatusBadGateway, "response_too_large", "上游响应超过代理安全上限"
+	default:
+		return http.StatusTooManyRequests, "stream_interrupted", "读取上游响应失败，请重试"
 	}
 }
 
@@ -1495,6 +1539,12 @@ func copyStreamWithFallbackModel(writer gin.ResponseWriter, source io.Reader, pr
 }
 
 func writeStreamAbortTrailer(writer gin.ResponseWriter, protocol streamProtocol, cause error, meta responseMetadata, compat *responsesCompatState, transferred int) {
+	// Nothing has been forwarded yet. Writing an SSE abort here would commit
+	// the pre-selected 2xx status; the caller must instead send a real error
+	// response (429) that agents will retry.
+	if transferred == 0 {
+		return
+	}
 	trailer := streamAbortTrailer(protocol, cause, meta, compat)
 	if len(trailer) == 0 || transferred+len(trailer) > maxStreamResponseTransferBytes {
 		return

@@ -29,6 +29,22 @@ func (idleErrorReader) Read([]byte) (int, error) {
 	return 0, neterror.ErrUpstreamStreamIdleTimeout
 }
 
+// chunkThenErrorReader yields data on the first Read, then the configured
+// error — the mid-stream failure shape where some bytes were already forwarded.
+type chunkThenErrorReader struct {
+	data []byte
+	err  error
+	done bool
+}
+
+func (r *chunkThenErrorReader) Read(target []byte) (int, error) {
+	if r.done {
+		return 0, r.err
+	}
+	r.done = true
+	return copy(target, r.data), nil
+}
+
 type outputLoopErrorReader struct{}
 
 func (outputLoopErrorReader) Read([]byte) (int, error) {
@@ -440,8 +456,8 @@ func TestNonStreamingEmptyAndIdleResponsesFailBeforeCommittingSuccess(t *testing
 		wantStatus int
 		wantCode   string
 	}{
-		{name: "empty", body: io.NopCloser(strings.NewReader("")), wantStatus: http.StatusBadGateway, wantCode: "upstream_response_empty"},
-		{name: "idle", body: io.NopCloser(idleErrorReader{}), wantStatus: http.StatusGatewayTimeout, wantCode: "upstream_stream_idle_timeout"},
+		{name: "empty", body: io.NopCloser(strings.NewReader("")), wantStatus: http.StatusTooManyRequests, wantCode: "upstream_response_empty"},
+		{name: "idle", body: io.NopCloser(idleErrorReader{}), wantStatus: http.StatusTooManyRequests, wantCode: "upstream_stream_idle_timeout"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			finalCode := ""
@@ -456,7 +472,73 @@ func TestNonStreamingEmptyAndIdleResponsesFailBeforeCommittingSuccess(t *testing
 			if recorder.Code != test.wantStatus || finalCode != test.wantCode || !strings.Contains(recorder.Body.String(), `"`+test.wantCode+`"`) {
 				t.Fatalf("status=%d body=%s finalize=%q", recorder.Code, recorder.Body.String(), finalCode)
 			}
+			if recorder.Code == http.StatusTooManyRequests && recorder.Header().Get("Retry-After") == "" {
+				t.Fatalf("429 missing Retry-After: %#v", recorder.Header())
+			}
 		})
+	}
+}
+
+func TestStreamingPreCommitFailuresReturnRetryable429(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := NewHandler(nil, nil, 1<<20)
+	for _, test := range []struct {
+		name       string
+		body       io.ReadCloser
+		wantCode   string
+		wantFragment string
+	}{
+		{name: "idle", body: io.NopCloser(idleErrorReader{}), wantCode: "upstream_stream_idle_timeout", wantFragment: "请重试"},
+		{name: "empty", body: io.NopCloser(strings.NewReader("")), wantCode: "upstream_response_empty", wantFragment: "请重试"},
+		{name: "interrupted", body: io.NopCloser(&chunkThenErrorReader{err: errors.New("upstream cut")}), wantCode: "stream_interrupted", wantFragment: "请重试"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// chunkThenErrorReader returns data on first Read — for a true
+			// pre-commit case use idleErrorReader/empty only. "interrupted"
+			// with no prefix data is simulated via a zero-length first chunk.
+			body := test.body
+			if test.name == "interrupted" {
+				body = io.NopCloser(&chunkThenErrorReader{data: nil, err: errors.New("upstream cut")})
+			}
+			finalCode := ""
+			result := &gateway.Result{
+				StatusCode: http.StatusOK, Status: "200 OK",
+				Header: http.Header{"Content-Type": {"text/event-stream"}},
+				Body:   body,
+				Finalize: func(_ gateway.Usage, _, code string) { finalCode = code },
+			}
+			router := gin.New()
+			router.GET("/", func(c *gin.Context) { handler.writeResult(c, result, true, streamProtocolResponses) })
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+			if recorder.Code != http.StatusTooManyRequests {
+				t.Fatalf("status=%d body=%s, want 429 so agents retry", recorder.Code, recorder.Body.String())
+			}
+			if finalCode != test.wantCode || !strings.Contains(recorder.Body.String(), `"`+test.wantCode+`"`) {
+				t.Fatalf("code finalize=%q body=%s", finalCode, recorder.Body.String())
+			}
+			if !strings.Contains(recorder.Body.String(), test.wantFragment) {
+				t.Fatalf("body %s missing %q", recorder.Body.String(), test.wantFragment)
+			}
+			if recorder.Header().Get("Retry-After") == "" {
+				t.Fatalf("429 missing Retry-After: %#v", recorder.Header())
+			}
+		})
+	}
+}
+
+func TestCopyStreamPreCommitFailureWritesNoBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	_, err := copyStreamWithFallbackModel(context.Writer, &idleErrorReader{}, streamProtocolResponses, nil, "grok-test")
+	if !errors.Is(err, errUpstreamStreamRead) || !errors.Is(err, neterror.ErrUpstreamStreamIdleTimeout) {
+		t.Fatalf("copy error = %v", err)
+	}
+	// Pre-commit failures must not write an SSE abort trailer — that would
+	// commit HTTP 200 and stop agents from retrying.
+	if got := recorder.Body.String(); got != "" {
+		t.Fatalf("pre-commit failure wrote body %q, want empty (caller sends 429)", got)
 	}
 }
 
@@ -1077,7 +1159,10 @@ func TestCopyStreamWritesTerminalOnIdleTimeout(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			context, _ := gin.CreateTestContext(recorder)
-			_, err := copyStreamWithFallbackModel(context.Writer, &idleErrorReader{}, test.protocol, nil, "grok-test")
+			// Mid-stream idle: some bytes were already forwarded, so the 200 is
+			// committed and the abort trailer is the only remaining signal.
+			prefix := []byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n")
+			_, err := copyStreamWithFallbackModel(context.Writer, &chunkThenErrorReader{data: prefix, err: neterror.ErrUpstreamStreamIdleTimeout}, test.protocol, nil, "grok-test")
 			if !errors.Is(err, errUpstreamStreamRead) || !errors.Is(err, neterror.ErrUpstreamStreamIdleTimeout) {
 				t.Fatalf("copy error = %v", err)
 			}
@@ -1106,7 +1191,8 @@ func TestCopyStreamWritesTerminalOnOutputLoop(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			context, _ := gin.CreateTestContext(recorder)
-			_, err := copyStreamWithFallbackModel(context.Writer, &outputLoopErrorReader{}, test.protocol, nil, "grok-test")
+			prefix := []byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n")
+			_, err := copyStreamWithFallbackModel(context.Writer, &chunkThenErrorReader{data: prefix, err: fmt.Errorf("%w (repeated content delta 129 times)", neterror.ErrUpstreamOutputLoop)}, test.protocol, nil, "grok-test")
 			if !errors.Is(err, errUpstreamStreamRead) || !errors.Is(err, neterror.ErrUpstreamOutputLoop) {
 				t.Fatalf("copy error = %v", err)
 			}
@@ -1169,8 +1255,12 @@ func TestCopyStreamDropsMalformedResponsesTailBeforeAbort(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	context, _ := gin.CreateTestContext(recorder)
-	malformed := []byte(`data: {"type":"response.output_text.delta","delta":"partial`)
-	_, err := copyStream(context.Writer, &chunkErrorReader{data: malformed}, streamProtocolResponses, nil)
+	// Forward a valid line first (so the 200 is committed), then a malformed
+	// tail and a cut. The malformed tail must be dropped; the abort trailer is
+	// the only remaining signal for the client.
+	prefix := `data: {"type":"response.output_text.delta","delta":"ok"}` + "\n\n"
+	malformed := `data: {"type":"response.output_text.delta","delta":"partial`
+	_, err := copyStream(context.Writer, &chunkThenErrorReader{data: []byte(prefix + malformed), err: errors.New("upstream cut")}, streamProtocolResponses, nil)
 	if !errors.Is(err, errUpstreamStreamRead) {
 		t.Fatalf("copy error = %v", err)
 	}
@@ -1202,7 +1292,8 @@ func TestCopyStreamWritesTerminalOnIncompleteEOF(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	context, _ := gin.CreateTestContext(recorder)
-	_, err := copyStreamWithFallbackModel(context.Writer, strings.NewReader(""), streamProtocolResponses, nil, "grok-test")
+	prefix := []byte(`data: {"type":"response.output_text.delta","delta":"hi"}` + "\n\n")
+	_, err := copyStreamWithFallbackModel(context.Writer, &chunkThenErrorReader{data: prefix, err: io.EOF}, streamProtocolResponses, nil, "grok-test")
 	if !errors.Is(err, errUpstreamStreamIncomplete) {
 		t.Fatalf("copy error = %v", err)
 	}
@@ -1228,7 +1319,8 @@ func TestCopyStreamAbortTrailerAlwaysIncludesModel(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	context, _ := gin.CreateTestContext(recorder)
-	_, err := copyStreamWithFallbackModel(context.Writer, &idleErrorReader{}, streamProtocolResponses, nil, "grok-test")
+	prefix := []byte(`data: {"type":"response.output_text.delta","delta":"hi"}` + "\n\n")
+	_, err := copyStreamWithFallbackModel(context.Writer, &chunkThenErrorReader{data: prefix, err: errors.New("upstream cut")}, streamProtocolResponses, nil, "grok-test")
 	if !errors.Is(err, errUpstreamStreamRead) {
 		t.Fatalf("copy error = %v", err)
 	}
@@ -1753,7 +1845,9 @@ func TestWriteResultOutputLoopFinalizesDistinctCode(t *testing.T) {
 	})
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/", nil))
-	if recorder.Code != http.StatusOK || finalCode != "upstream_output_loop" || !strings.Contains(recorder.Body.String(), `"message":"upstream_output_loop:`) {
+	// Pre-commit output loop is non-retryable: 502 with a distinct code, not a
+	// committed 200 that agents treat as a finished turn.
+	if recorder.Code != http.StatusBadGateway || finalCode != "upstream_output_loop" || !strings.Contains(recorder.Body.String(), `"code":"upstream_output_loop"`) {
 		t.Fatalf("status=%d finalize=%q body=%q", recorder.Code, finalCode, recorder.Body.String())
 	}
 }
