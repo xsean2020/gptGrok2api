@@ -90,9 +90,17 @@ media:
 
 routing:
   # [按需修改] 服务端推理回放缓存：多轮时自动补回客户端未携带的 encrypted_content。
+  # 回放缓存按账号隔离：密文思考绑定产出它的账号，换号不会注入旧密文。
   reasoningReplayEnabled: true
   reasoningReplayTTL: 1h
   reasoningReplayMaxEntries: 10240
+  # [可省略] 无状态导出策略，决定密文思考与会话身份如何发往上游。
+  # 不填默认 hybrid，线上旧配置文件无需修改。
+  # hybrid（默认）：账号回放命中时保留密文；未命中且请求仍带密文（多半是中途换号）
+  #   则剥离 encrypted_content 与 prompt_cache_key / x-grok 会话头，只发明文摘要。
+  # stateless：每轮都只发明文，任意换号安全，但丢失加密 CoT 连续性。
+  # sticky：保留旧行为（回放 key 已按账号隔离，跨号不注入；客户端密文依赖 400 恢复）。
+  # statelessMode: hybrid
   # [按需修改] 按账号隔离上游连接池，适合外部 L4/连接哈希负载均衡；会增加连接数、TLS 握手和文件描述符占用。
   accountIsolatedConnections: false
   # [通常不要修改] 大账号池默认使用有界分段选号；保留完整池回退、额度优先级和原子并发门禁。

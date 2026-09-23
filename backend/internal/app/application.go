@@ -213,6 +213,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		TokenAuth: cfg.Provider.Build.TokenAuth, UserAgent: cfg.Provider.Build.UserAgent,
 		ResponseHeaderTimeout: cfg.Provider.Build.ResponseHeaderTimeout.Value(),
 		StreamIdleTimeout:     cfg.Provider.Build.StreamIdleTimeout.Value(),
+		StatelessMode:         cfg.Routing.StatelessMode,
 	}, cipher)
 	cliAdapter.SetLogger(logger)
 	cliAdapter.SetEgress(egressManager)
@@ -391,6 +392,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 			TokenAuth: next.Provider.Build.TokenAuth, UserAgent: next.Provider.Build.UserAgent,
 			ResponseHeaderTimeout: next.Provider.Build.ResponseHeaderTimeout.Value(),
 			StreamIdleTimeout:     next.Provider.Build.StreamIdleTimeout.Value(),
+			StatelessMode:         next.Routing.StatelessMode,
 		})
 		egressManager.UpdateBuildResponseHeaderTimeout(next.Provider.Build.ResponseHeaderTimeout.Value())
 		egressManager.UpdateBuildStreamIdleTimeout(next.Provider.Build.StreamIdleTimeout.Value())

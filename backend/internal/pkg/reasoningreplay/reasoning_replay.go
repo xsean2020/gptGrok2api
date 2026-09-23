@@ -59,6 +59,21 @@ func (r *ReasoningReplay) Enabled() bool {
 	return cfg != nil && cfg.Enabled
 }
 
+// Has reports whether this exact scope still holds replayable items. Used by
+// the hybrid stateless export to distinguish a same-account continuation from
+// a possible account switch without mutating the cache.
+func (r *ReasoningReplay) Has(ctx context.Context, model, sessionKey string) bool {
+	if !r.Enabled() || strings.TrimSpace(sessionKey) == "" || strings.TrimSpace(model) == "" {
+		return false
+	}
+	cfg := r.cfg.Load()
+	items, ok, err := r.store.Get(ctx, model, sessionKey, r.now().UTC(), cfg.TTL)
+	if err != nil || !ok {
+		return false
+	}
+	return len(items) > 0
+}
+
 // Apply 将缓存的上一轮 output items 注入 Responses body.input。
 func (r *ReasoningReplay) Apply(ctx context.Context, model, sessionKey string, body []byte) []byte {
 	if r == nil || r.store == nil || strings.TrimSpace(sessionKey) == "" || strings.TrimSpace(model) == "" || len(body) == 0 {

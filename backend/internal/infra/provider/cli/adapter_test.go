@@ -371,7 +371,7 @@ func TestGrokTurnIndexRequiresStableSession(t *testing.T) {
 	}
 }
 
-func TestForwardResponseReplaysReasoningAcrossAccountsAndMessagesTurns(t *testing.T) {
+func TestForwardResponseReplaysReasoningOnSameAccountAcrossMessagesTurns(t *testing.T) {
 	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
 	if err != nil {
 		t.Fatal(err)
@@ -413,10 +413,10 @@ func TestForwardResponseReplaysReasoningAcrossAccountsAndMessagesTurns(t *testin
 			}
 		case 3:
 			if len(payload.Input) != 4 || payload.Input[0]["role"] != "user" || payload.Input[1]["type"] != "reasoning" || payload.Input[1]["encrypted_content"] != replayEncrypted || payload.Input[2]["role"] != "assistant" || payload.Input[3]["role"] != "user" {
-				t.Fatalf("ordinary replay after WebSearch = %#v", payload.Input)
+				t.Fatalf("same-account replay after WebSearch = %#v", payload.Input)
 			}
 			if _, exists := payload.Input[1]["content"]; exists {
-				t.Fatalf("cross-account replay included content: %#v", payload.Input[1])
+				t.Fatalf("replayed opaque reasoning included content: %#v", payload.Input[1])
 			}
 		}
 		body := `{"id":"resp_3","model":"grok-4.5","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"second"}]}]}`
@@ -469,10 +469,8 @@ func TestForwardResponseReplaysReasoningAcrossAccountsAndMessagesTurns(t *testin
 		t.Fatal(err)
 	}
 
-	otherCredential := credential
-	otherCredential.ID = 8
 	second, err := adapter.ForwardResponse(context.Background(), provider.ResponseResourceRequest{
-		Credential: otherCredential, Method: http.MethodPost, Path: "/responses", Model: "grok-4.5",
+		Credential: credential, Method: http.MethodPost, Path: "/responses", Model: "grok-4.5",
 		NormalizeBody: true, Operation: conversation.OperationMessages, PromptCacheKey: "messages-cache-key", ReasoningReplayKey: "messages-replay-key",
 		Body: []byte(`{"model":"public","max_tokens":128,"messages":[{"role":"user","content":"first"},{"role":"assistant","content":"first"},{"role":"user","content":"second"}]}`),
 	})
@@ -488,7 +486,155 @@ func TestForwardResponseReplaysReasoningAcrossAccountsAndMessagesTurns(t *testin
 	}
 }
 
-func TestReasoningReplayScopeSharesAccountSeparatesPlane(t *testing.T) {
+func TestForwardResponseDoesNotReplayReasoningAcrossAccounts(t *testing.T) {
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := cipher.Encrypt("access-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawEncrypted := make([]byte, 64)
+	for index := range rawEncrypted {
+		rawEncrypted[index] = byte(index)
+	}
+	replayEncrypted := base64.RawStdEncoding.EncodeToString(rawEncrypted)
+	requestCount := 0
+	adapter := NewAdapter(Config{BaseURL: "https://cli-chat-proxy.grok.com/v1", StatelessMode: "hybrid"}, cipher)
+	adapter.SetReasoningReplay(reasoningreplay.New(
+		memory.NewReasoningReplayStore(16),
+		reasoningreplay.Config{Enabled: true, TTL: time.Hour},
+		nil,
+	))
+	var secondInput []map[string]any
+	adapter.http.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requestCount++
+		if requestCount == 2 {
+			var payload struct {
+				Input []map[string]any `json:"input"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			secondInput = payload.Input
+		}
+		body := `{"id":"resp_2","model":"grok-4.5","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"second"}]}]}`
+		if requestCount == 1 {
+			body = `{"id":"resp_1","model":"grok-4.5","status":"completed","output":[{"type":"reasoning","encrypted_content":"` + replayEncrypted + `"},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"first"}]}]}`
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK, Status: "200 OK",
+			Header: http.Header{"Content-Type": []string{"application/json"}},
+			Body:   io.NopCloser(strings.NewReader(body)), Request: request,
+		}, nil
+	})
+
+	accountA := account.Credential{ID: 7, Provider: account.ProviderBuild, EncryptedAccessToken: encrypted}
+	first, err := adapter.ForwardResponse(context.Background(), provider.ResponseResourceRequest{
+		Credential: accountA, Method: http.MethodPost, Path: "/responses", Model: "grok-4.5",
+		NormalizeBody: true, Operation: conversation.OperationMessages,
+		PromptCacheKey: "messages-cache-key", ReasoningReplayKey: "messages-replay-key",
+		Body: []byte(`{"model":"public","max_tokens":128,"messages":[{"role":"user","content":"first"}]}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(first.Body); err != nil {
+		t.Fatal(err)
+	}
+	_ = first.Body.Close()
+
+	accountB := accountA
+	accountB.ID = 8
+	second, err := adapter.ForwardResponse(context.Background(), provider.ResponseResourceRequest{
+		Credential: accountB, Method: http.MethodPost, Path: "/responses", Model: "grok-4.5",
+		NormalizeBody: true, Operation: conversation.OperationMessages,
+		PromptCacheKey: "messages-cache-key", ReasoningReplayKey: "messages-replay-key",
+		Body: []byte(`{"model":"public","max_tokens":128,"messages":[{"role":"user","content":"first"},{"role":"assistant","content":"first"},{"role":"user","content":"second"}]}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Body.Close()
+	if _, err := io.ReadAll(second.Body); err != nil {
+		t.Fatal(err)
+	}
+	if requestCount != 2 {
+		t.Fatalf("request count = %d", requestCount)
+	}
+	for _, item := range secondInput {
+		if item["type"] == "reasoning" {
+			t.Fatalf("cross-account replay leaked opaque reasoning: %#v", item)
+		}
+	}
+}
+
+func TestHybridStatelessTurnStripsClientCiphertextOnAccountSwitch(t *testing.T) {
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := cipher.Encrypt("access-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawEncrypted := make([]byte, 64)
+	for index := range rawEncrypted {
+		rawEncrypted[index] = byte(index)
+	}
+	clientCiphertext := base64.RawStdEncoding.EncodeToString(rawEncrypted)
+	adapter := NewAdapter(Config{BaseURL: "https://cli-chat-proxy.grok.com/v1", StatelessMode: "hybrid"}, cipher)
+	adapter.SetReasoningReplay(reasoningreplay.New(
+		memory.NewReasoningReplayStore(16),
+		reasoningreplay.Config{Enabled: true, TTL: time.Hour},
+		nil,
+	))
+	var forwarded map[string]any
+	var forwardedHeaders http.Header
+	adapter.http.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		forwardedHeaders = request.Header.Clone()
+		if err := json.NewDecoder(request.Body).Decode(&forwarded); err != nil {
+			return nil, err
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK, Status: "200 OK",
+			Header: http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(
+				`{"id":"resp_1","model":"grok-4.5","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}`,
+			)), Request: request,
+		}, nil
+	})
+
+	accountB := account.Credential{ID: 8, Provider: account.ProviderBuild, EncryptedAccessToken: encrypted}
+	response, err := adapter.ForwardResponse(context.Background(), provider.ResponseResourceRequest{
+		Credential: accountB, Method: http.MethodPost, Path: "/responses", Model: "grok-4.5",
+		NormalizeBody: true, PromptCacheKey: "messages-cache-key", ReasoningReplayKey: "messages-replay-key",
+		Body: []byte(`{"model":"public","input":[{"type":"reasoning","summary":[],"encrypted_content":"` + clientCiphertext + `"},{"role":"user","content":"continue"}]}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if _, err := io.ReadAll(response.Body); err != nil {
+		t.Fatal(err)
+	}
+	input, _ := forwarded["input"].([]any)
+	for _, raw := range input {
+		item, ok := raw.(map[string]any)
+		if ok && item["type"] == "reasoning" {
+			t.Fatalf("hybrid stateless turn kept opaque reasoning: %#v", item)
+		}
+	}
+	if key, _ := forwarded["prompt_cache_key"].(string); key != "" {
+		t.Fatalf("stateless turn kept prompt_cache_key: %q", key)
+	}
+	if forwardedHeaders.Get("x-grok-session-id") != "" || forwardedHeaders.Get("x-grok-conv-id") != "" {
+		t.Fatalf("stateless turn kept session headers: %#v", forwardedHeaders)
+	}
+}
+
+func TestReasoningReplayScopeIsolatesAccountAndSeparatesPlane(t *testing.T) {
 	adapter := NewAdapter(Config{
 		BaseURL:         "https://build.example/v1",
 		FallbackBaseURL: "https://xai.example/v1",
@@ -503,12 +649,12 @@ func TestReasoningReplayScopeSharesAccountSeparatesPlane(t *testing.T) {
 	}
 	otherAccount := request
 	otherAccount.Credential.ID = 8
-	if got := adapter.scopedReasoningReplayKey(otherAccount, "https://build.example/v1"); got != buildKey {
-		t.Fatal("reasoning replay scope was not shared across accounts")
+	if got := adapter.scopedReasoningReplayKey(otherAccount, "https://build.example/v1"); got == buildKey {
+		t.Fatal("reasoning replay scope leaked across accounts")
 	}
 	zeroAccount := request
 	zeroAccount.Credential.ID = 0
-	if got := adapter.scopedReasoningReplayKey(zeroAccount, "https://build.example/v1"); got != buildKey {
+	if got := adapter.scopedReasoningReplayKey(zeroAccount, "https://build.example/v1"); got == buildKey {
 		t.Fatal("reasoning replay scope still depended on account identity")
 	}
 	if got := adapter.scopedReasoningReplayKey(request, "https://xai.example/v1"); got == buildKey {
@@ -520,7 +666,7 @@ func TestReasoningReplayScopeSharesAccountSeparatesPlane(t *testing.T) {
 	}
 }
 
-func TestConversationReasoningReplaySharesExplicitSessionAcrossAccounts(t *testing.T) {
+func TestConversationReasoningReplayIsolatesAccounts(t *testing.T) {
 	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
 	if err != nil {
 		t.Fatal(err)
@@ -582,21 +728,16 @@ func TestConversationReasoningReplaySharesExplicitSessionAcrossAccounts(t *testi
 	if !ok {
 		t.Fatalf("second upstream input = %#v", secondRequest["input"])
 	}
-	found := false
 	for _, raw := range input {
 		item, ok := raw.(map[string]any)
 		if ok && item["type"] == "reasoning" && item["encrypted_content"] == "portable-proof" {
-			found = true
-			if _, hasContent := item["content"]; hasContent {
-				t.Fatalf("replayed opaque reasoning contains content: %#v", item)
-			}
+			t.Fatalf("cross-account conversation reasoning leaked: %#v", item)
 		}
 	}
-	if !found {
-		t.Fatalf("portable reasoning was not restored: %#v", input)
-	}
-	if firstScope := adapter.conversationReasoningScope(firstRequest, adapter.primaryBaseURL()); firstScope == "" || firstScope != adapter.conversationReasoningScope(secondRequestInput, adapter.primaryBaseURL()) {
-		t.Fatal("conversation reasoning scope unexpectedly depends on account")
+	firstScope := adapter.conversationReasoningScope(firstRequest, adapter.primaryBaseURL())
+	secondScope := adapter.conversationReasoningScope(secondRequestInput, adapter.primaryBaseURL())
+	if firstScope == "" || firstScope == secondScope {
+		t.Fatal("conversation reasoning scope must isolate accounts")
 	}
 }
 

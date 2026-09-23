@@ -230,6 +230,11 @@ type RoutingConfig struct {
 	ReasoningReplayEnabled      bool     `yaml:"reasoningReplayEnabled"`
 	ReasoningReplayTTL          Duration `yaml:"reasoningReplayTTL"`
 	ReasoningReplayMaxEntries   int      `yaml:"reasoningReplayMaxEntries"`
+	// StatelessMode controls how opaque reasoning and session identity leave
+	// the gateway. hybrid (default) strips client ciphertext only when the
+	// account-scoped replay misses (possible account switch). stateless always
+	// strips. sticky keeps legacy ciphertext-on-hit behavior.
+	StatelessMode string `yaml:"statelessMode"`
 	// AutoAssignMaxNodeShare optionally caps how many active accounts one
 	// healthy node may absorb during auto assignment. 0 keeps the historical
 	// unbounded first-pass evacuation. Values in [0.05, 1] are a fraction of
@@ -686,6 +691,11 @@ func (c Config) Validate() error {
 	if c.Routing.ReasoningReplayMaxEntries < 100 || c.Routing.ReasoningReplayMaxEntries > 1000000 {
 		return errors.New("routing.reasoningReplayMaxEntries 必须在 100 到 1000000 之间")
 	}
+	switch strings.ToLower(strings.TrimSpace(c.Routing.StatelessMode)) {
+	case "", "sticky", "hybrid", "stateless":
+	default:
+		return errors.New("routing.statelessMode 必须是 sticky、hybrid 或 stateless")
+	}
 	if !validAutoAssignShare(c.Routing.AutoAssignMaxNodeShare) || !validAutoAssignShare(c.Routing.AutoAssignMaxMigrationShare) {
 		return errors.New("routing.autoAssignMaxNodeShare 与 autoAssignMaxMigrationShare 必须为 0 或 0.05 到 1 之间")
 	}
@@ -939,6 +949,7 @@ func defaultConfig() Config {
 			ReasoningReplayEnabled:      true,
 			ReasoningReplayTTL:          Duration(time.Hour),
 			ReasoningReplayMaxEntries:   10240,
+			StatelessMode:               "hybrid",
 		},
 		Audit: AuditConfig{
 			BufferSize: 16384, BatchSize: 256, FlushInterval: Duration(250 * time.Millisecond), CommitDelay: Duration(5 * time.Millisecond),

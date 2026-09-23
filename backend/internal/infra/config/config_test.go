@@ -166,6 +166,9 @@ bootstrapAdmin:
 	if !cfg.Routing.ReasoningReplayEnabled || cfg.Routing.ReasoningReplayTTL.Value() != time.Hour || cfg.Routing.ReasoningReplayMaxEntries != 10240 {
 		t.Fatalf("reasoning replay defaults = %#v", cfg.Routing)
 	}
+	if cfg.Routing.StatelessMode != "hybrid" {
+		t.Fatalf("statelessMode default = %q, want hybrid (online configs without the key must not need edits)", cfg.Routing.StatelessMode)
+	}
 	if cfg.Audit.CommitDelay.Value() != 5*time.Millisecond {
 		t.Fatalf("audit commit delay = %s", cfg.Audit.CommitDelay.Value())
 	}
@@ -706,5 +709,30 @@ func TestEffectivePublicAPIBaseURLPriority(t *testing.T) {
 				t.Fatalf("EffectivePublicAPIBaseURL() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestLoadWithoutStatelessModeKeepsHybrid(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	// Online config files that predate statelessMode must keep working unchanged.
+	data := []byte(`secrets:
+  jwtSecret: "12345678901234567890123456789012"
+  credentialEncryptionKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+bootstrapAdmin:
+  username: "admin"
+  password: "password123"
+routing:
+  reasoningReplayEnabled: true
+`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Routing.StatelessMode != "hybrid" {
+		t.Fatalf("statelessMode = %q, want hybrid when the key is omitted", cfg.Routing.StatelessMode)
 	}
 }

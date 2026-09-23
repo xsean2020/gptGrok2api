@@ -44,6 +44,28 @@ type Config struct {
 	UserAgent             string
 	ResponseHeaderTimeout time.Duration
 	StreamIdleTimeout     time.Duration
+	// StatelessMode controls how opaque reasoning and session identity are
+	// exported upstream. sticky keeps ciphertext on replay hits; hybrid strips
+	// client ciphertext when the account-scoped replay misses; stateless always
+	// strips. Empty behaves as hybrid.
+	StatelessMode string
+}
+
+const (
+	statelessModeSticky    = "sticky"
+	statelessModeHybrid    = "hybrid"
+	statelessModeStateless = "stateless"
+)
+
+func normalizeStatelessMode(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case statelessModeSticky:
+		return statelessModeSticky
+	case statelessModeStateless:
+		return statelessModeStateless
+	default:
+		return statelessModeHybrid
+	}
 }
 
 const (
@@ -69,8 +91,9 @@ type Adapter struct {
 	replay         *reasoningreplay.ReasoningReplay
 	// conversationReasoningCache bridges Chat/Messages tool calls to the
 	// upstream Responses reasoning proof. It is deliberately separate from
-	// the persistent native Responses replay, and its keys never contain an
-	// account ID: encrypted reasoning is portable across Build accounts.
+	// the persistent native Responses replay. Both caches are account-scoped:
+	// encrypted reasoning is bound to the account that produced it and must
+	// never be injected into another account's request.
 	conversationReasoningCache *conversation.ReasoningCache
 	compaction                 *gatewayCompactionCodec
 	logger                     *slog.Logger
@@ -250,8 +273,8 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	compactionRequested := false
 	// Resolve the physical inference plane before normalization so Chat and
 	// Anthropic conversion can use the same scope for capture and restoration.
-	// The scope contains the trusted session seed, model, and plane only; it is
-	// intentionally independent of the selected account.
+	// The scope contains the trusted session seed, model, plane, and account:
+	// encrypted reasoning is account-bound and must never cross accounts.
 	primaryBase := a.primaryBaseURL()
 	base := a.inferenceBaseForOperation(request.Credential, request.Billing, request.Method, request.Path)
 	conversationScope := a.conversationReasoningScope(request, base)
@@ -299,42 +322,56 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 		if err != nil {
 			return invalidResponsesResponse(err), nil
 		}
-	}
-	if len(body) > 0 && request.Method == http.MethodPost {
-		if !compactionRequested {
-			allowClientTools := request.AllowClientToolCacheRoute || (account.RoutingCandidate{Credential: request.Credential, Billing: request.Billing}).IsKnownFreeBuild()
-			body, cacheRoute, err = prepareBuildPromptCacheRoute(body, request.Operation, request.Model, request.PromptCacheKey, allowClientTools)
-			if err != nil {
-				err = fmt.Errorf("准备 Build prompt cache 路由: %w", err)
-				if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
-					return invalidConversationResponse(request.Operation, err), nil
-				}
-				return invalidResponsesResponse(err), nil
-			}
-			body, err = injectPromptCacheKey(body, request.PromptCacheKey)
-			if err != nil {
-				err = fmt.Errorf("写入 prompt_cache_key: %w", err)
-				if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
-					return invalidConversationResponse(request.Operation, err), nil
-				}
-				return invalidResponsesResponse(err), nil
-			}
-		}
-	}
-	if compactionRequested {
 		warnings := ""
 		if toolCompatibility != nil {
 			warnings = toolCompatibility.warningHeader()
 		}
 		return a.forwardGatewayCompaction(ctx, request, accessToken, body, warnings)
 	}
+	// Stateless export must run before prompt-cache injection and replay apply.
+	// An account-scoped replay miss plus client-held ciphertext means this turn
+	// may have switched accounts: strip opaque reasoning and session identity
+	// so the new account never sees undecodable state.
+	statelessTurn := a.shouldExportStatelessTurn(ctx, request, base, body)
+	if statelessTurn {
+		body, _ = stripReasoningEncryptedContent(body)
+		body = removePromptCacheKey(body)
+		request.PromptCacheKey = ""
+	}
+	if len(body) > 0 && request.Method == http.MethodPost {
+		allowClientTools := request.AllowClientToolCacheRoute || (account.RoutingCandidate{Credential: request.Credential, Billing: request.Billing}).IsKnownFreeBuild()
+		body, cacheRoute, err = prepareBuildPromptCacheRoute(body, request.Operation, request.Model, request.PromptCacheKey, allowClientTools)
+		if err != nil {
+			err = fmt.Errorf("准备 Build prompt cache 路由: %w", err)
+			if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
+				return invalidConversationResponse(request.Operation, err), nil
+			}
+			return invalidResponsesResponse(err), nil
+		}
+		body, err = injectPromptCacheKey(body, request.PromptCacheKey)
+		if err != nil {
+			err = fmt.Errorf("写入 prompt_cache_key: %w", err)
+			if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
+				return invalidConversationResponse(request.Operation, err), nil
+			}
+			return invalidResponsesResponse(err), nil
+		}
+	}
 	// Explicit mode wins; in auto mode only confirmed Super accounts with bot_flag_source/bfs in {1,2} default to XAI.
-	// Prompt-cache affinity and reasoning replay use separate identities. The
-	// native Responses replay remains account-scoped, while the Chat/Messages
-	// bridge is scoped to the client session, model, and physical plane only;
-	// encrypted reasoning is portable across accounts on that plane.
+	// Prompt-cache affinity and reasoning replay use separate identities. Both
+	// replay caches are account-scoped: encrypted reasoning is bound to the
+	// account that produced it. Cross-account turns must not inject ciphertext
+	// and fall back to a stateless export (summary-only, no session identity).
 	replayBaseBody := body
-	body, replayKey := a.applyReasoningReplay(ctx, request, replayBaseBody, base)
+	var replayKey string
+	if statelessTurn {
+		// No injection: client ciphertext is already stripped and this account
+		// has no replay history. Still capture under the account-scoped key so a
+		// later turn on the same account can restore it.
+		replayKey = a.scopedReasoningReplayKey(request, base)
+	} else {
+		body, replayKey = a.applyReasoningReplay(ctx, request, replayBaseBody, base)
+	}
 	call := a.doResponseRequest(ctx, request, accessToken, body, base)
 	if call.err != nil {
 		return nil, call.err
@@ -550,6 +587,94 @@ func (a *Adapter) applyReasoningReplay(ctx context.Context, request provider.Res
 	return a.replay.Apply(ctx, request.Model, key, body), key
 }
 
+// shouldExportStatelessTurn reports whether this request must leave the
+// upstream with no opaque reasoning and no session identity. hybrid (default)
+// triggers only when the account-scoped replay has no history for this account
+// but the body still carries ciphertext — the signature of a mid-task account
+// switch. sticky keeps legacy behavior; stateless always exports portable.
+func (a *Adapter) shouldExportStatelessTurn(ctx context.Context, request provider.ResponseResourceRequest, base string, body []byte) bool {
+	switch normalizeStatelessMode(a.config().StatelessMode) {
+	case statelessModeStateless:
+		return true
+	case statelessModeHybrid:
+		if a.replay == nil || !a.replay.Enabled() {
+			return false
+		}
+		key := a.scopedReasoningReplayKey(request, base)
+		if key == "" {
+			return false
+		}
+		if a.replay.Has(ctx, request.Model, key) {
+			return false
+		}
+		return bodyHasOpaqueReasoning(body)
+	default:
+		return false
+	}
+}
+
+// bodyHasOpaqueReasoning reports whether the request carries account-bound
+// reasoning ciphertext in either Responses input items or Anthropic thinking
+// blocks (pre-conversion).
+func bodyHasOpaqueReasoning(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(body, &payload) != nil {
+		return false
+	}
+	if raw, ok := payload["input"]; ok && reasoningInputHasEncrypted(raw) {
+		return true
+	}
+	if raw, ok := payload["messages"]; ok && anthropicMessagesHaveThinking(raw) {
+		return true
+	}
+	return false
+}
+
+func reasoningInputHasEncrypted(raw json.RawMessage) bool {
+	var items []map[string]json.RawMessage
+	if json.Unmarshal(raw, &items) != nil {
+		return false
+	}
+	for _, item := range items {
+		var typeName, encrypted string
+		_ = json.Unmarshal(item["type"], &typeName)
+		_ = json.Unmarshal(item["encrypted_content"], &encrypted)
+		if strings.TrimSpace(typeName) == "reasoning" && strings.TrimSpace(encrypted) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func anthropicMessagesHaveThinking(raw json.RawMessage) bool {
+	var messages []map[string]json.RawMessage
+	if json.Unmarshal(raw, &messages) != nil {
+		return false
+	}
+	for _, message := range messages {
+		content, ok := message["content"]
+		if !ok {
+			continue
+		}
+		var blocks []map[string]json.RawMessage
+		if json.Unmarshal(content, &blocks) != nil {
+			continue
+		}
+		for _, block := range blocks {
+			var typeName string
+			_ = json.Unmarshal(block["type"], &typeName)
+			switch strings.TrimSpace(typeName) {
+			case "thinking", "redacted_thinking":
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (a *Adapter) scopedReasoningReplayKey(request provider.ResponseResourceRequest, base string) string {
 	seed := strings.TrimSpace(request.ReasoningReplayKey)
 	if seed == "" {
@@ -559,7 +684,9 @@ func (a *Adapter) scopedReasoningReplayKey(request provider.ResponseResourceRequ
 	if fallback := a.fallbackBaseURL(); fallback != "" && strings.EqualFold(strings.TrimRight(base, "/"), fallback) {
 		plane = "xai"
 	}
-	digest := sha256.Sum256([]byte(fmt.Sprintf("grok2api:reasoning-replay:v3:%s:%s", seed, plane)))
+	// v4: account-scoped. v3 shared ciphertext across accounts and triggered
+	// upstream "could not decrypt the provided encrypted_content" on failover.
+	digest := sha256.Sum256([]byte(fmt.Sprintf("grok2api:reasoning-replay:v4:%d:%s:%s", request.Credential.ID, seed, plane)))
 	return hex.EncodeToString(digest[:])
 }
 
@@ -573,7 +700,8 @@ func (a *Adapter) conversationReasoningScope(request provider.ResponseResourceRe
 	if fallback := a.fallbackBaseURL(); fallback != "" && strings.EqualFold(strings.TrimRight(base, "/"), fallback) {
 		plane = "xai"
 	}
-	digest := sha256.Sum256([]byte(fmt.Sprintf("grok2api:conversation-reasoning:v1:%s:%s:%s", seed, model, plane)))
+	// v2: account-scoped, same rationale as scopedReasoningReplayKey v4.
+	digest := sha256.Sum256([]byte(fmt.Sprintf("grok2api:conversation-reasoning:v2:%d:%s:%s:%s", request.Credential.ID, seed, model, plane)))
 	return hex.EncodeToString(digest[:])
 }
 

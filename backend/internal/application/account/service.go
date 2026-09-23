@@ -58,7 +58,7 @@ const (
 const (
 	// estimatedFreeTokenLimit is only a fallback until an upstream exhaustion
 	// response supplies the account-specific actual/limit pair.
-	estimatedFreeTokenLimit         int64         = 500_000
+	estimatedFreeTokenLimit         int64         = 850_000
 	freeUsageWindow                 time.Duration = 24 * time.Hour
 	forcedRefreshMinInterval        time.Duration = 30 * time.Second
 	paidProbeRetryInterval          time.Duration = 15 * time.Minute
