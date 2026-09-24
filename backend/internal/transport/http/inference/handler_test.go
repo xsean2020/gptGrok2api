@@ -491,6 +491,7 @@ func TestStreamingPreCommitFailuresReturnRetryable429(t *testing.T) {
 		{name: "idle", body: io.NopCloser(idleErrorReader{}), wantCode: "upstream_stream_idle_timeout", wantFragment: "请重试"},
 		{name: "empty", body: io.NopCloser(strings.NewReader("")), wantCode: "upstream_response_empty", wantFragment: "请重试"},
 		{name: "interrupted", body: io.NopCloser(&chunkThenErrorReader{err: errors.New("upstream cut")}), wantCode: "stream_interrupted", wantFragment: "请重试"},
+		{name: "client_abort", body: io.NopCloser(&chunkThenErrorReader{data: []byte("d"), err: errors.New("cut")}), wantCode: "client_stream_interrupted", wantFragment: "client_stream_interrupted"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			// chunkThenErrorReader returns data on first Read — for a true
@@ -509,8 +510,14 @@ func TestStreamingPreCommitFailuresReturnRetryable429(t *testing.T) {
 			}
 			router := gin.New()
 			router.GET("/", func(c *gin.Context) { handler.writeResult(c, result, true, streamProtocolResponses) })
+			request := httptest.NewRequest(http.MethodGet, "/", nil)
+			if test.name == "client_abort" {
+				ctx, cancel := context.WithCancel(request.Context())
+				cancel()
+				request = request.WithContext(ctx)
+			}
 			recorder := httptest.NewRecorder()
-			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+			router.ServeHTTP(recorder, request)
 			if recorder.Code != http.StatusTooManyRequests {
 				t.Fatalf("status=%d body=%s, want 429 so agents retry", recorder.Code, recorder.Body.String())
 			}
@@ -1132,6 +1139,12 @@ func TestClassifyCopyErrorDistinguishesClientFromUpstream(t *testing.T) {
 	if got := classifyCopyError(context.Background(), readErr); got != "upstream_stream_interrupted" {
 		t.Fatalf("upstream abort = %q", got)
 	}
+	// A closed upstream body can surface context.Canceled while the downstream
+	// client is still waiting. That is an upstream cut, not a client hang-up.
+	bodyCloseErr := fmt.Errorf("%w: %w", errUpstreamStreamRead, context.Canceled)
+	if got := classifyCopyError(context.Background(), bodyCloseErr); got != "upstream_stream_interrupted" {
+		t.Fatalf("closed-body cancel = %q, want upstream_stream_interrupted", got)
+	}
 	idle, stop := context.WithCancelCause(context.Background())
 	stop(neterror.ErrUpstreamStreamIdleTimeout)
 	idleErr := fmt.Errorf("%w: %w", errUpstreamStreamRead, neterror.ErrUpstreamStreamIdleTimeout)
@@ -1282,9 +1295,10 @@ func TestCopyStreamDoesNotAppendAbortAfterUpstreamFailureTerminal(t *testing.T) 
 	if !errors.Is(err, errUpstreamStreamFailed) {
 		t.Fatalf("copy error = %v", err)
 	}
-	got := recorder.Body.String()
-	if strings.Count(got, `"type":"response.failed"`) != 1 || strings.Contains(got, `"type":"response.incomplete"`) {
-		t.Fatalf("upstream terminal was followed by a second terminal event: %q", got)
+	// A failure-only stream must not commit any body under 2xx; the caller
+	// maps errUpstreamStreamFailed to a retryable status instead.
+	if got := recorder.Body.String(); got != "" {
+		t.Fatalf("failure-only stream committed body %q, want empty", got)
 	}
 }
 
@@ -1648,11 +1662,63 @@ func TestCopyStreamRequiresProtocolTerminalEvent(t *testing.T) {
 			} else if metadata.StreamFailure != nil {
 				t.Fatalf("unexpected stream failure diagnostic = %#v", metadata.StreamFailure)
 			}
+			if errors.Is(test.wantErr, errUpstreamStreamFailed) {
+				// Failure-only streams are not committed under 2xx so agents
+				// can retry; the error is returned to the caller instead.
+				if got := recorder.Body.String(); got != "" {
+					t.Fatalf("failure-only stream committed body %q, want empty", got)
+				}
+				return
+			}
 			if test.protocol != streamProtocolResponses && recorder.Body.String() != test.body {
 				t.Fatalf("forwarded = %q", recorder.Body.String())
 			}
 			if test.protocol == streamProtocolResponses && !strings.Contains(recorder.Body.String(), `"type":`) {
 				t.Fatalf("responses stream missing type: %q", recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestNon2xxUpstreamNeverBecomes2xx(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := NewHandler(nil, nil, 1<<20)
+	for _, test := range []struct {
+		name       string
+		status     int
+		stream     bool
+		body       string
+		wantStatus int
+	}{
+		{name: "500 json", status: http.StatusInternalServerError, body: `{"error":"boom"}`, wantStatus: http.StatusInternalServerError},
+		{name: "429 json", status: http.StatusTooManyRequests, body: `{"error":"slow down"}`, wantStatus: http.StatusTooManyRequests},
+		{name: "400 json", status: http.StatusBadRequest, body: `{"error":"bad"}`, wantStatus: http.StatusBadRequest},
+		{name: "500 stream json", status: http.StatusInternalServerError, stream: true, body: `{"error":"boom"}`, wantStatus: http.StatusInternalServerError},
+		{name: "500 stream sse", status: http.StatusInternalServerError, stream: true, body: "data: {\"type\":\"error\"}\n\n", wantStatus: http.StatusInternalServerError},
+		{name: "302 redirect", status: http.StatusFound, body: ``, wantStatus: http.StatusBadGateway},
+		{name: "503", status: http.StatusServiceUnavailable, body: `{"error":"down"}`, wantStatus: http.StatusServiceUnavailable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			finalCode := ""
+			result := &gateway.Result{
+				StatusCode: test.status,
+				Status:     http.StatusText(test.status),
+				Header:     http.Header{"Content-Type": {"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(test.body)),
+				Finalize:   func(_ gateway.Usage, _, code string) { finalCode = code },
+			}
+			router := gin.New()
+			router.GET("/", func(c *gin.Context) { handler.writeResult(c, result, test.stream, streamProtocolResponses) })
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+			if recorder.Code == http.StatusOK || recorder.Code >= 300 && recorder.Code < 400 && test.wantStatus != http.StatusBadGateway {
+				t.Fatalf("status=%d, must never be 2xx for a non-2xx upstream", recorder.Code)
+			}
+			if recorder.Code != test.wantStatus {
+				t.Fatalf("status=%d body=%s, want %d", recorder.Code, recorder.Body.String(), test.wantStatus)
+			}
+			if finalCode == "" {
+				t.Fatalf("missing finalize code, body=%s", recorder.Body.String())
 			}
 		})
 	}
@@ -1682,8 +1748,13 @@ func TestWriteResultRecordsStreamFailureDiagnostic(t *testing.T) {
 	})
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
-	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"type":"response.failed"`) || finalCode != "upstream_stream_error" {
+	// A failure-only stream must not commit 2xx: agents treat 200 as done and
+	// will not retry an error payload delivered under a success status.
+	if recorder.Code != http.StatusTooManyRequests || finalCode != "upstream_stream_error" {
 		t.Fatalf("status=%d body=%q final=%q", recorder.Code, recorder.Body.String(), finalCode)
+	}
+	if !strings.Contains(recorder.Body.String(), `"code":"upstream_stream_error"`) {
+		t.Fatalf("body missing error code: %q", recorder.Body.String())
 	}
 	if diagnostic == nil || !strings.Contains(string(diagnostic.Body), `"code":"server_error"`) {
 		t.Fatalf("diagnostic = %#v", diagnostic)

@@ -228,6 +228,7 @@ type Service struct {
 	modelSyncing                map[uint64]struct{}
 	markBuildChatDeniedAsReauth atomic.Bool
 	qualityRetry                atomic.Pointer[QualityRetryRuntime]
+	idleReplay                  idleReplayStore
 }
 
 type teamModelRateLimit struct {
@@ -1024,6 +1025,15 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	attemptPolicy := newRequestRoutingAttemptPolicy(int(s.maxAttempts.Load()), ownership != nil || input.ForcedAccountID != 0)
 	idempotencyID, _ := security.NewOpaqueToken(18)
 	pricingModel := s.providers.PricingModel(route.Provider, route.UpstreamModel)
+	var replayLeader *idleReplayEntry
+	if entry, leader := s.beginIdleReplay(&input); entry != nil && !leader {
+		// Identical retry, or a "continue" turn whose previous generation is
+		// already complete. Return the cached bytes and do not call the model.
+		return entry.follow(ctx)
+	} else if leader {
+		replayLeader = entry
+		defer replayLeader.abandonIfUnpublished()
+	}
 	if err := s.checkLedgerReady(); err != nil {
 		return nil, err
 	}
@@ -1183,7 +1193,11 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 			markFirstToken = firstToken.mark
 		}
 		timingHandedOff = true
-		return &Result{StatusCode: response.StatusCode, Status: response.Status, Header: response.Header, Body: &finalizingBody{ReadCloser: response.Body, finalize: func() { finalize(Usage{}, "", "stream_closed") }}, MarkFirstToken: markFirstToken, RecordStreamFailure: recordStreamFailure, Finalize: finalize}
+		resultBody := io.ReadCloser(&finalizingBody{ReadCloser: response.Body, finalize: func() { finalize(Usage{}, "", "stream_closed") }})
+		if replayLeader != nil {
+			resultBody = replayLeader.tee(response.StatusCode, response.Header, resultBody)
+		}
+		return &Result{StatusCode: response.StatusCode, Status: response.Status, Header: response.Header, Body: resultBody, MarkFirstToken: markFirstToken, RecordStreamFailure: recordStreamFailure, Finalize: finalize}
 	}
 	// fail_open retains at most one successful no-thinking stream. The account
 	// lease is released immediately; the read pump applies upstream backpressure
@@ -1314,6 +1328,12 @@ attemptLoop:
 			}
 			lastFailure = newTransportUpstreamFailure(err, credential.ID, credential.Name)
 			if !isRetryableTransportFailure(credential.Provider, err) {
+				break
+			}
+			// Bytes already arrived before the idle timeout. Another model call
+			// would discard that generation; return the failure to the client so
+			// a retry can download the cached prefix instead.
+			if neterrorpkg.IsUpstreamStreamIdleTimeout(err) && neterrorpkg.IdleTimeoutObservedData(err) {
 				break
 			}
 			responseFailure := false
@@ -1578,6 +1598,15 @@ attemptLoop:
 			if qualityHoldEnabled {
 				replay, verdict, peekUsage, _, peekErr := peekQualityStream(ctx, response.Body, qualityProtocolForOperation(operation), holdCfg)
 				if peekErr != nil {
+					idleTimeout := neterrorpkg.IsUpstreamStreamIdleTimeout(peekErr) || neterrorpkg.IsUpstreamStreamIdleTimeout(context.Cause(ctx))
+					if idleTimeout && replay != nil {
+						if restored, ok := replayPrefix(replay); ok {
+							response.Body = restored
+							s.logger.Info("upstream_stream_idle_cached", "request_id", input.RequestID, "account_id", credential.ID)
+							return handoffResponse(response, lease, credential, responseStartedAt), nil
+						}
+						replay = nil
+					}
 					if replay != nil {
 						_ = replay.Close()
 					} else {
@@ -1590,7 +1619,20 @@ attemptLoop:
 						break
 					}
 					lastFailure = newTransportUpstreamFailure(peekErr, credential.ID, credential.Name)
-					if neterrorpkg.IsUpstreamStreamIdleTimeout(peekErr) || neterrorpkg.IsUpstreamStreamIdleTimeout(context.Cause(ctx)) || errors.Is(peekErr, errQualityEmptyStream) {
+					if idleTimeout {
+						logPrefix := "quality_peek_idle"
+						writeCtx, writeCancel := context.WithTimeout(context.WithoutCancel(ctx), finalizationTimeout)
+						if markErr := s.selector.MarkFailureAfterSuccess(writeCtx, credential, http.StatusGatewayTimeout, holdCfg.IdleAccountCooldown); markErr != nil {
+							s.logger.Warn(logPrefix+"_cooldown_failed", "request_id", input.RequestID, "account_id", credential.ID, "error", markErr)
+						} else {
+							s.logger.Warn(logPrefix+"_return_cached", "request_id", input.RequestID, "account_id", credential.ID, "cooldown", holdCfg.IdleAccountCooldown)
+						}
+						writeCancel()
+						// The client already waited out an idle generation. Do not
+						// start another model call in this request.
+						break
+					}
+					if errors.Is(peekErr, errQualityEmptyStream) {
 						logPrefix := "quality_peek_idle"
 						if errors.Is(peekErr, errQualityEmptyStream) {
 							logPrefix = "quality_peek_empty"

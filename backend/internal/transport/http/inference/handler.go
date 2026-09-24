@@ -1295,28 +1295,38 @@ func (h *Handler) writeProtocolResult(c *gin.Context, result *gateway.Result, st
 		return
 	}
 	copyHeaders(c.Writer.Header(), result.Header)
-	if result.StatusCode >= 400 {
+	// Invariant: a non-2xx upstream status must never be committed as 2xx
+	// downstream. Agents treat 2xx as a finished turn and will not retry an
+	// error body delivered under a success status.
+	if result.StatusCode < http.StatusOK || result.StatusCode >= http.StatusMultipleChoices {
 		errorCode = "upstream_error"
-		if stream && !isEventStreamContentType(result.Header.Get("Content-Type")) {
-			raw, readErr := io.ReadAll(io.LimitReader(result.Body, maxJSONResponseTransferBytes+1))
-			if readErr != nil {
-				if anthropic {
-					writeAnthropicError(c, http.StatusBadGateway, "api_error", "读取上游错误响应失败", "upstream_error")
-				} else {
-					writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "读取上游错误响应失败")
-				}
-				return
-			}
-			c.Writer.Header().Del("Content-Length")
-			code, message := gateway.ClassifyUpstreamHTTPError(result.StatusCode, raw)
-			errorCode = code
+		status := result.StatusCode
+		if status < http.StatusBadRequest {
+			// 1xx/3xx never reach clients as success; surface a retryable 502.
+			status = http.StatusBadGateway
+		}
+		raw, readErr := io.ReadAll(io.LimitReader(result.Body, maxJSONResponseTransferBytes+1))
+		if readErr != nil {
+			errorCode = "upstream_error"
 			if anthropic {
-				writeAnthropicError(c, result.StatusCode, anthropicUpstreamHTTPErrorType(result.StatusCode), message, errorCode)
+				writeAnthropicError(c, http.StatusBadGateway, "api_error", "读取上游错误响应失败", "upstream_error")
 			} else {
-				writeOpenAIError(c, result.StatusCode, errorCode, message)
+				writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "读取上游错误响应失败")
 			}
 			return
 		}
+		c.Writer.Header().Del("Content-Length")
+		code, message := gateway.ClassifyUpstreamHTTPError(result.StatusCode, raw)
+		errorCode = code
+		if status == http.StatusTooManyRequests {
+			c.Header("Retry-After", "1")
+		}
+		if anthropic {
+			writeAnthropicError(c, status, anthropicUpstreamHTTPErrorType(status), message, errorCode)
+		} else {
+			writeOpenAIError(c, status, errorCode, message)
+		}
+		return
 	}
 	c.Status(result.StatusCode)
 	var err error
@@ -1336,9 +1346,11 @@ func (h *Handler) writeProtocolResult(c *gin.Context, result *gateway.Result, st
 		errorCode = classifyCopyError(c.Request.Context(), err)
 		// Pre-commit stream failure: nothing has been written yet, so the 2xx
 		// selected above is still overridable. Commit a retryable 429 instead —
-		// agents treat 200 as a finished turn and will not retry. Keep the
-		// precise errorCode from classifyCopyError for audit and finalize.
-		if stream && !c.Writer.Written() && errorCode != "client_stream_interrupted" {
+		// agents treat 200 as a finished turn (or as "no content") and will not
+		// retry. This includes client_stream_interrupted: if the client is truly
+		// gone the status is never delivered, and if the failure was
+		// misclassified the agent still needs a retryable status to continue.
+		if stream && !c.Writer.Written() {
 			status, _, message := preCommitStreamFailureResponse(err)
 			if status == http.StatusTooManyRequests {
 				c.Header("Retry-After", "1")
@@ -1395,8 +1407,14 @@ func classifyCopyError(ctx context.Context, err error) string {
 	if err == nil {
 		return ""
 	}
+	// IsClientRequestCancel can match a closed upstream body that surfaces
+	// context.Canceled while the downstream client is still connected. Only
+	// treat it as a client abort when the request context itself is canceled
+	// (real hang-up) or the failure is not an upstream copy error.
 	if neterror.IsClientRequestCancel(ctx, err) {
-		return "client_stream_interrupted"
+		if ctx == nil || ctx.Err() != nil || !errors.Is(err, errUpstreamStreamRead) {
+			return "client_stream_interrupted"
+		}
 	}
 	switch {
 	case errors.Is(err, errResponseTransferLimit):
@@ -1454,6 +1472,41 @@ func copyStreamWithFallbackModel(writer gin.ResponseWriter, source io.Reader, pr
 	buffer := make([]byte, responseCopyBufferBytes)
 	received := 0
 	transferred := 0
+	// Delay the first write until the stream shows success evidence so a
+	// failure-only payload (response.failed / error event) never commits 2xx.
+	// Agents treat 2xx as a finished turn and will not retry an error body
+	// delivered under a success status.
+	committed := false
+	commit := func(data []byte) error {
+		if len(data) == 0 {
+			return nil
+		}
+		if transferred+len(data) > maxStreamResponseTransferBytes {
+			return fmt.Errorf("%w: 流式响应超过 %d MiB", errResponseTransferLimit, maxStreamResponseTransferBytes>>20)
+		}
+		if err := setResponseWriteDeadline(writer); err != nil {
+			return err
+		}
+		if _, err := writer.Write(data); err != nil {
+			return err
+		}
+		writer.Flush()
+		transferred += len(data)
+		committed = true
+		inspector.markFirstTokenForwarded()
+		return nil
+	}
+	stage := func(data []byte) error {
+		if len(data) == 0 {
+			return nil
+		}
+		// A failure-only payload must not commit 2xx: agents treat 200 as done
+		// and will not retry an error body delivered under a success status.
+		if !committed && isFailureTerminalEvent(data, protocol) && !containsGeneratedDelta(data, protocol) {
+			return nil
+		}
+		return commit(data)
+	}
 	for {
 		n, readErr := source.Read(buffer)
 		if n > 0 {
@@ -1477,54 +1530,38 @@ func copyStreamWithFallbackModel(writer gin.ResponseWriter, source io.Reader, pr
 				// output-observed classification.
 				inspector.Inspect(chunk)
 			}
-			if transferred+len(chunk) > maxStreamResponseTransferBytes {
-				return inspector.Metadata(), fmt.Errorf("%w: 流式响应超过 %d MiB", errResponseTransferLimit, maxStreamResponseTransferBytes>>20)
+			if err := stage(chunk); err != nil {
+				return inspector.Metadata(), err
 			}
-			if len(chunk) > 0 {
-				if err := setResponseWriteDeadline(writer); err != nil {
-					return inspector.Metadata(), err
-				}
-				if _, err := writer.Write(chunk); err != nil {
-					return inspector.Metadata(), err
-				}
-				writer.Flush()
-				transferred += len(chunk)
-			}
-			inspector.markFirstTokenForwarded()
 		}
 		if readErr != nil {
 			if tail := markerFilter.Filter(nil, true); len(tail) > 0 {
-				if transferred+len(tail) > maxStreamResponseTransferBytes {
-					return inspector.Metadata(), fmt.Errorf("%w: 流式响应超过 %d MiB", errResponseTransferLimit, maxStreamResponseTransferBytes>>20)
-				}
-				if err := setResponseWriteDeadline(writer); err != nil {
+				if err := stage(tail); err != nil {
 					return inspector.Metadata(), err
 				}
-				if _, err := writer.Write(tail); err != nil {
-					return inspector.Metadata(), err
-				}
-				writer.Flush()
-				transferred += len(tail)
 			}
 			if protocol == streamProtocolResponses {
 				if tail := flushResponsesStreamTail(&compat); len(tail) > 0 {
 					inspector.Inspect(tail)
-					if transferred+len(tail) > maxStreamResponseTransferBytes {
-						return inspector.Metadata(), fmt.Errorf("%w: 流式响应超过 %d MiB", errResponseTransferLimit, maxStreamResponseTransferBytes>>20)
-					}
-					if err := setResponseWriteDeadline(writer); err != nil {
+					if err := stage(tail); err != nil {
 						return inspector.Metadata(), err
 					}
-					if _, err := writer.Write(tail); err != nil {
-						return inspector.Metadata(), err
-					}
-					writer.Flush()
-					transferred += len(tail)
 				}
 			}
 			inspector.Finish()
 			inspector.markFirstTokenForwarded()
 			terminalErr := inspector.TerminalError()
+			if !committed && terminalErr != nil {
+				// Nothing reached the client. Surface the error so the caller
+				// can send a retryable status instead of committing 200.
+				if errors.Is(terminalErr, errUpstreamStreamFailed) {
+					return inspector.Metadata(), terminalErr
+				}
+				if errors.Is(readErr, io.EOF) {
+					return inspector.Metadata(), terminalErr
+				}
+				return inspector.Metadata(), fmt.Errorf("%w: %w", errUpstreamStreamRead, readErr)
+			}
 			if terminalErr == nil || errors.Is(terminalErr, errUpstreamStreamFailed) {
 				return inspector.Metadata(), terminalErr
 			}
@@ -1535,6 +1572,24 @@ func copyStreamWithFallbackModel(writer gin.ResponseWriter, source io.Reader, pr
 			writeStreamAbortTrailer(writer, protocol, readErr, inspector.Metadata(), &compat, transferred)
 			return inspector.Metadata(), fmt.Errorf("%w: %w", errUpstreamStreamRead, readErr)
 		}
+	}
+}
+
+// isFailureTerminalEvent reports whether the downstream chunk is a terminal
+// failure (Responses response.failed / error, Chat/Anthropic error event).
+func isFailureTerminalEvent(chunk []byte, protocol streamProtocol) bool {
+	if len(chunk) == 0 {
+		return false
+	}
+	switch protocol {
+	case streamProtocolResponses:
+		return bytes.Contains(chunk, []byte(`"type":"response.failed"`)) ||
+			bytes.Contains(chunk, []byte(`"type":"response.error"`)) ||
+			bytes.Contains(chunk, []byte(`"status":"failed"`))
+	case streamProtocolChat, streamProtocolAnthropic:
+		return bytes.Contains(chunk, []byte(`"type":"error"`))
+	default:
+		return false
 	}
 }
 
